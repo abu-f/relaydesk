@@ -241,12 +241,13 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 		return nil, fmt.Errorf("standard TLS failed (%v) and uTLS reconnect failed: %w", err, err)
 	}
 	client := utls.UClient(conn, config, utls.HelloChrome_Auto)
-	if err := client.HandshakeContext(ctx); err == nil {
+	utlsErr := client.HandshakeContext(ctx)
+	if utlsErr == nil {
 		log.Printf("uTLS handshake succeeded for %s via %s (ALPN: %s)", host, routeLabel(route), client.ConnectionState().NegotiatedProtocol)
 		return &utlsNetConn{UConn: client, state: standardConnectionState(client.ConnectionState())}, nil
 	}
 	conn.Close()
-	log.Printf("uTLS handshake also failed for %s via %s: %v", host, routeLabel(route), err)
+	log.Printf("uTLS handshake also failed for %s via %s: %v", host, routeLabel(route), utlsErr)
 	return nil, fmt.Errorf("standard TLS and uTLS handshake both failed for %s", host)
 }
 
