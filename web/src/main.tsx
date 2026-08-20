@@ -220,13 +220,11 @@ function Login({ onLogin }: { onLogin: () => void }) {
         </div>
       </div>
       <form className="login-card" onSubmit={submit}>
-        <div className="eyebrow">PRIVATE CONTROL PLANE</div>
+        <div className="eyebrow">管理员登录</div>
         <h1>
-          把请求，交给
-          <br />
-          <em>更好的路径。</em>
+          欢迎回来
         </h1>
-        <p>管理模型、代理与使用记录。所有上游凭证只在服务器侧保存。</p>
+        <p>登录 Relay Desk，管理模型、代理与使用记录。</p>
         <label>
           管理员密码
           <input
@@ -370,6 +368,8 @@ function Console({
             <button
               key={id}
               className={page === id ? "active" : ""}
+              aria-current={page === id ? "page" : undefined}
+              aria-label={`${zh}（${en}）`}
               onClick={() => setPage(id)}
             >
               <Icon size={17} />
@@ -396,8 +396,8 @@ function Console({
         <header>
           <div>
             <div className="crumb">
-              CONTROL ROOM <ChevronRight size={13} />{" "}
-              {nav.find((n) => n[0] === page)?.[1].toUpperCase()}
+              Relay Desk <ChevronRight size={13} />
+              {nav.find((n) => n[0] === page)?.[2]}
             </div>
             <h2>{nav.find((n) => n[0] === page)?.[2]}</h2>
           </div>
