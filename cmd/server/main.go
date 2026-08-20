@@ -3829,13 +3829,21 @@ func asAnySlice(value any) ([]any, bool) {
 
 func asMapSlice(value any) ([]map[string]any, bool) {
 	items, ok := asAnySlice(value)
-	if !ok { return nil, false }
-	out := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		mapped, ok := item.(map[string]any)
-		if !ok { return nil, false }
-		out = append(out, mapped)
+	if ok {
+		out := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			mapped, ok := item.(map[string]any)
+			if !ok { out = nil; break }
+			out = append(out, mapped)
+		}
+		if out != nil { return out, true }
 	}
+	// yaml.v3 may preserve a concrete slice type in interface values; a
+	// marshal/unmarshal round-trip safely normalizes those typed collections.
+	data, err := yaml.Marshal(value)
+	if err != nil { return nil, false }
+	var out []map[string]any
+	if yaml.Unmarshal(data, &out) != nil { return nil, false }
 	return out, true
 }
 
