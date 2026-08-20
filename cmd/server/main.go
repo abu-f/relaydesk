@@ -32,6 +32,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/proxy"
+	"gopkg.in/yaml.v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -103,6 +104,7 @@ type ProxyRecord struct {
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
 	LastCheckOK   bool       `json:"last_check_ok"`
+	LastLatencyMS *int64     `json:"last_latency_ms,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 }
 
@@ -417,6 +419,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE proxies ADD COLUMN expires_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_checked_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_check_ok INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE proxies ADD COLUMN last_latency_ms INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN proxy_uri TEXT",
 		"ALTER TABLE usage_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'chat'",
 		"ALTER TABLE usage_requests ADD COLUMN first_token_latency_ms INTEGER",
@@ -672,6 +675,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/proxies", a.requireAdmin(a.listProxies))
 	mux.HandleFunc("POST /api/proxies", a.requireAdmin(a.addProxy))
 	mux.HandleFunc("POST /api/proxies/import", a.requireAdmin(a.importProxies))
+	mux.HandleFunc("POST /api/proxies/import-subscription", a.requireAdmin(a.importSubscription))
 	mux.HandleFunc("POST /api/proxies/bulk-delete", a.requireAdmin(a.bulkDeleteProxies))
 	mux.HandleFunc("PATCH /api/proxies/{id}", a.requireAdmin(a.patchProxy))
 	mux.HandleFunc("DELETE /api/proxies/{id}", a.requireAdmin(a.deleteProxy))
@@ -965,6 +969,15 @@ func (a *App) markProxyQuotaCooldown(id int64, minutes int) {
 	a.invalidateProxySnapshot()
 }
 
+func (a *App) markProxyTimeout(id int64) {
+	now := time.Now().UTC()
+	if _, err := a.db.Exec("UPDATE proxies SET health_status='timeout',failure_count=failure_count+1,cooldown_until=NULL,updated_at=? WHERE id=? AND enabled=1", now.Format(time.RFC3339), id); err != nil {
+		log.Printf("mark proxy %d timeout failed: %v", id, err)
+		return
+	}
+	a.invalidateProxySnapshot()
+}
+
 func (a *App) markProxyCheckFailed(id int64) {
 	max := a.healthcheckMaxFailures()
 	if max <= 0 {
@@ -1037,7 +1050,7 @@ func (a *App) getHealthCheck(w http.ResponseWriter, r *http.Request) {
 	passed := a.hcPassed
 	failed := a.hcFailed
 	a.hcStateMu.Unlock()
-	healthy, cooldown, unknown := a.poolHealthCounts()
+	healthy, cooldown, timeout, unknown, disabled := a.poolHealthCounts()
 	var nextRun any
 	if lastRun.IsZero() {
 		nextRun = time.Now().UTC().Format(time.RFC3339)
@@ -1059,21 +1072,28 @@ func (a *App) getHealthCheck(w http.ResponseWriter, r *http.Request) {
 		"next_run_at":      nextRun,
 		"healthy_proxies":  healthy,
 		"cooldown_proxies": cooldown,
+		"timeout_proxies":  timeout,
 		"unknown_proxies":  unknown,
-		"total_proxies":    healthy + cooldown + unknown,
+		"disabled_proxies": disabled,
+		"total_proxies":    healthy + cooldown + timeout + unknown + disabled,
 	})
 }
 
-func (a *App) poolHealthCounts() (healthy, cooldown, unknown int) {
-	rows, err := a.db.Query("SELECT health_status, COUNT(*) FROM proxies WHERE enabled=1 GROUP BY health_status")
+func (a *App) poolHealthCounts() (healthy, cooldown, timeout, unknown, disabled int) {
+	rows, err := a.db.Query("SELECT health_status, enabled, COUNT(*) FROM proxies GROUP BY health_status, enabled")
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0, 0
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var status string
+		var enabled int
 		var count int
-		if err := rows.Scan(&status, &count); err != nil {
+		if err := rows.Scan(&status, &enabled, &count); err != nil {
+			continue
+		}
+		if enabled == 0 {
+			disabled += count
 			continue
 		}
 		switch status {
@@ -1081,11 +1101,13 @@ func (a *App) poolHealthCounts() (healthy, cooldown, unknown int) {
 			healthy += count
 		case "cooldown":
 			cooldown += count
+		case "timeout":
+			timeout += count
 		default:
 			unknown += count
 		}
 	}
-	return healthy, cooldown, unknown
+	return healthy, cooldown, timeout, unknown, disabled
 }
 
 func (a *App) putHealthCheck(w http.ResponseWriter, r *http.Request) {
@@ -1220,20 +1242,22 @@ func (a *App) runChecks(proxies []ProxyRecord, method, testURL string, payload [
 	var workersWG sync.WaitGroup
 	var mu sync.Mutex
 	check := func(p ProxyRecord) {
-		ok := a.healthCheckProxy(p, method, testURL, payload)
+		result := a.healthCheckProxy(p, method, testURL, payload)
 		mu.Lock()
-		if ok {
+		if result.OK {
 			passed++
 		} else {
 			failed++
 		}
 		mu.Unlock()
-		if ok {
+		if result.OK {
 			a.markProxySuccess(p.ID)
+		} else if result.TimedOut {
+			a.markProxyTimeout(p.ID)
 		} else {
 			a.markProxyCheckFailed(p.ID)
 		}
-		a.recordProxyCheck(p.ID, ok)
+		a.recordProxyCheck(p.ID, result.OK, result.Latency)
 	}
 	workersWG.Add(workers)
 	for range workers {
@@ -1292,7 +1316,7 @@ func (a *App) runUnverifiedHealthCheck() {
 	a.hcStateMu.Unlock()
 	start := time.Now()
 	log.Printf("unverified health check started")
-	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,created_at FROM proxies WHERE enabled=1 AND health_status='unknown' ORDER BY id")
+	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE enabled=1 AND health_status='unknown' ORDER BY id")
 	if err != nil {
 		log.Printf("unverified health check: could not load proxies: %v", err)
 		a.hcStateMu.Lock()
@@ -1322,7 +1346,7 @@ func (a *App) runUnverifiedHealthCheck() {
 }
 
 func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
-	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,created_at FROM proxies WHERE enabled=1 ORDER BY id")
+	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE enabled=1 ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -1331,8 +1355,9 @@ func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
+		var latency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
 			return nil, err
 		}
 		p.Password, err = a.decrypt(encrypted)
@@ -1341,6 +1366,9 @@ func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
+		if latency >= 0 {
+			p.LastLatencyMS = &latency
+		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if checked != "" {
 			t, _ := time.Parse(time.RFC3339, checked)
@@ -1357,7 +1385,14 @@ func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
 	return out, rows.Err()
 }
 
-func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []byte) bool {
+type proxyCheckResult struct {
+	OK      bool
+	TimedOut bool
+	Latency time.Duration
+}
+
+func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []byte) proxyCheckResult {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(a.appContext(), 15*time.Second)
 	defer cancel()
 	var req *http.Request
@@ -1371,7 +1406,7 @@ func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []
 		req, err = http.NewRequestWithContext(ctx, method, testURL, nil)
 	}
 	if err != nil {
-		return false
+		return proxyCheckResult{Latency: time.Since(started)}
 	}
 	req.Header.Set("User-Agent", "relaydesk-healthcheck/1.0")
 	// When testing the upstream chat/completions endpoint, attach the real
@@ -1383,12 +1418,13 @@ func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []
 		}
 	}
 	resp, err := a.doProxyRequest(req, p)
+	latency := time.Since(started)
 	if err != nil {
-		return false
+		return proxyCheckResult{TimedOut: errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded, Latency: latency}
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	return proxyCheckResult{OK: resp.StatusCode >= 200 && resp.StatusCode < 300, Latency: latency}
 }
 
 func (a *App) sessionProxyRequestLimit() int {
@@ -3265,7 +3301,7 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 
 	a.deleteExpiredProxies()
 	a.deleteStaleSessionRoutes()
-	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,created_at FROM proxies WHERE enabled=1 ORDER BY id")
+	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE enabled=1 AND health_status<>'timeout' ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -3274,8 +3310,9 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
+		var latency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
 			return nil, err
 		}
 		p.Password, err = a.decrypt(encrypted)
@@ -3284,10 +3321,16 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
+		if latency >= 0 {
+			p.LastLatencyMS = &latency
+		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if checked != "" {
 			t, _ := time.Parse(time.RFC3339, checked)
 			p.LastCheckedAt = &t
+		}
+		if p.HealthStatus == "timeout" {
+			continue
 		}
 		if cool != "" {
 			t, _ := time.Parse(time.RFC3339, cool)
@@ -3464,7 +3507,7 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	where, args, ok := proxyFilterClause(state, now)
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state must be all, unverified, healthy, cooldown, disabled, unused, or in_use"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state must be all, unverified, healthy, cooldown, timeout, disabled, unused, or in_use"})
 		return
 	}
 
@@ -3555,6 +3598,8 @@ func proxyFilterClause(state string, now time.Time) (string, []any, bool) {
 		return " WHERE p.enabled=1 AND p.health_status='healthy'", nil, true
 	case "cooldown":
 		return " WHERE p.enabled=1 AND p.cooldown_until IS NOT NULL AND p.cooldown_until<>'' AND p.cooldown_until>?", []any{nowText}, true
+	case "timeout":
+		return " WHERE p.enabled=1 AND p.health_status='timeout'", nil, true
 	case "disabled":
 		return " WHERE p.enabled=0", nil, true
 	case "unused":
@@ -3618,12 +3663,16 @@ func scanProxies(rows *sql.Rows) ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
+		var latency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
 			return nil, err
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
+		if latency >= 0 {
+			p.LastLatencyMS = &latency
+		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if cool != "" {
 			t, _ := time.Parse(time.RFC3339, cool)
@@ -3680,6 +3729,174 @@ func parseProxy(raw string) (ProxyRecord, error) {
 	}
 	p.URI = safe.String()
 	return p, nil
+}
+
+func mihomoConfigPath() string {
+	if path := strings.TrimSpace(os.Getenv("MIHOMO_CONFIG_PATH")); path != "" {
+		return path
+	}
+	return "/mihomo/config.yaml"
+}
+
+func mihomoReloadConfigPath() string {
+	if path := strings.TrimSpace(os.Getenv("MIHOMO_RELOAD_CONFIG_PATH")); path != "" {
+		return path
+	}
+	return "/root/.config/mihomo/config.yaml"
+}
+
+type mihomoFileConfig map[string]any
+
+func readMihomoFileConfig() (mihomoFileConfig, error) {
+	cfg := mihomoFileConfig{}
+	data, err := os.ReadFile(mihomoConfigPath())
+	if err != nil {
+		return nil, fmt.Errorf("read mihomo config: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse mihomo config: %w", err)
+	}
+	return cfg, nil
+}
+
+func writeMihomoFileConfig(cfg mihomoFileConfig) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("encode mihomo config: %w", err)
+	}
+	path := mihomoConfigPath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("write mihomo config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace mihomo config: %w", err)
+	}
+	return nil
+}
+
+func (a *App) reloadMihomoConfig() error {
+	cfg, err := a.loadMihomo()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.ControlURL) == "" {
+		return errors.New("mihomo control_url is not configured")
+	}
+	body, _ := json.Marshal(map[string]string{"path": mihomoReloadConfigPath()})
+	req, err := http.NewRequest("PUT", strings.TrimRight(cfg.ControlURL, "/")+"/configs?force=true", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
+	}
+	resp, err := directHTTPClient(15 * time.Second).Do(req)
+	if err != nil {
+		return fmt.Errorf("reload mihomo config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("mihomo config reload returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func removeString(values []string, target string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if value != target {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func asMapSlice(value any) ([]map[string]any, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		mapped, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, mapped)
+	}
+	return out, true
+}
+
+func asStringSlice(value any) ([]string, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, text)
+	}
+	return out, true
+}
+
+func stringsAsAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
+func (a *App) removeMihomoNode(name string) error {
+	cfg, err := readMihomoFileConfig()
+	if err != nil {
+		return err
+	}
+	proxies, ok := asMapSlice(cfg["proxies"])
+	if !ok {
+		return errors.New("mihomo config has an invalid proxies section")
+	}
+	found := false
+	remaining := make([]any, 0, len(proxies))
+	for _, proxy := range proxies {
+		if proxyName, _ := proxy["name"].(string); proxyName == name {
+			found = true
+			continue
+		}
+		remaining = append(remaining, proxy)
+	}
+	if !found {
+		return nil
+	}
+	cfg["proxies"] = remaining
+	if groups, ok := cfg["proxy-groups"].([]any); ok {
+		for _, item := range groups {
+			group, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			members, ok := asStringSlice(group["proxies"])
+			if !ok {
+				continue
+			}
+			members = removeString(members, name)
+			if len(members) == 0 {
+				members = []string{"DIRECT"}
+			}
+			group["proxies"] = stringsAsAny(members)
+		}
+	}
+	if err := writeMihomoFileConfig(cfg); err != nil {
+		return err
+	}
+	return a.reloadMihomoConfig()
 }
 
 func redactProxyInput(raw string) string {
@@ -3761,6 +3978,135 @@ func (a *App) addProxy(w http.ResponseWriter, r *http.Request) {
 	p.ID = id
 	writeJSON(w, 201, p)
 }
+func decodeSubscriptionPayload(raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", "")); err == nil && len(decoded) > 0 {
+		return string(decoded)
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", "")); err == nil && len(decoded) > 0 {
+		return string(decoded)
+	}
+	return text
+}
+
+func subscriptionVLESS(uri string) (map[string]any, string, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil || parsed.Scheme != "vless" || parsed.Hostname() == "" || parsed.User == nil || parsed.User.Username() == "" {
+		return nil, "", errors.New("invalid vless subscription node")
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return nil, "", errors.New("vless node port is invalid")
+	}
+	name, _ := url.PathUnescape(parsed.Fragment)
+	name = strings.TrimSpace(name)
+	if name == "" || hasMihomoInfoMarker(name) {
+		return nil, "", errors.New("subscription line is an informational alias")
+	}
+	q := parsed.Query()
+	proxy := map[string]any{"name": name, "type": "vless", "server": parsed.Hostname(), "port": port, "uuid": parsed.User.Username(), "udp": true}
+	switch q.Get("security") {
+	case "tls":
+		proxy["tls"] = true
+	case "reality":
+		proxy["tls"] = true
+		reality := map[string]any{}
+		if v := q.Get("pbk"); v != "" { reality["public-key"] = v }
+		if v := q.Get("sid"); v != "" { reality["short-id"] = v }
+		if len(reality) > 0 { proxy["reality-opts"] = reality }
+		if v := q.Get("flow"); v != "" { proxy["flow"] = v }
+	}
+	if v := q.Get("sni"); v != "" { proxy["servername"] = v }
+	if v := q.Get("fp"); v != "" { proxy["client-fingerprint"] = v }
+	if q.Get("insecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") { proxy["skip-cert-verify"] = true }
+	if q.Get("type") == "ws" {
+		proxy["network"] = "ws"
+		ws := map[string]any{}
+		if v := q.Get("path"); v != "" { ws["path"] = v }
+		if v := q.Get("host"); v != "" { ws["headers"] = map[string]any{"Host": v} }
+		proxy["ws-opts"] = ws
+	}
+	return proxy, name, nil
+}
+
+func subscriptionGroup(name string) string {
+	upper := strings.ToUpper(name)
+	switch {
+	case strings.Contains(name, "日本") || strings.Contains(upper, "JP"):
+		return "Japan"
+	case strings.Contains(name, "新加坡") || strings.Contains(upper, "SG"):
+		return "Singapore"
+	case strings.Contains(name, "美国") || strings.Contains(upper, "US"):
+		return "USA"
+	case strings.Contains(name, "台湾") || strings.Contains(upper, "TW"):
+		return "Taiwan"
+	case strings.Contains(name, "香港") || strings.Contains(upper, "HK"):
+		return "HongKong"
+	default:
+		return "Auto"
+	}
+}
+
+func appendGroupMember(cfg mihomoFileConfig, groupName, nodeName string) {
+	groups, ok := cfg["proxy-groups"].([]any)
+	if !ok { return }
+	for _, item := range groups {
+		group, ok := item.(map[string]any)
+		if !ok || group["name"] != groupName { continue }
+		members, ok := asStringSlice(group["proxies"])
+		if !ok { return }
+		if !containsString(members, nodeName) { members = append(members, nodeName) }
+		group["proxies"] = stringsAsAny(members)
+		return
+	}
+}
+
+func (a *App) importSubscription(w http.ResponseWriter, r *http.Request) {
+	var in struct { SubscriptionURL string `json:"subscription_url"` }
+	if readJSON(r, &in) != nil || strings.TrimSpace(in.SubscriptionURL) == "" {
+		writeJSON(w, 400, map[string]string{"error": "subscription_url is required"})
+		return
+	}
+	subURL, err := url.Parse(strings.TrimSpace(in.SubscriptionURL))
+	if err != nil || (subURL.Scheme != "https" && subURL.Scheme != "http") || subURL.Host == "" {
+		writeJSON(w, 400, map[string]string{"error": "subscription_url must be an http(s) URL"})
+		return
+	}
+	resp, err := directHTTPClient(30 * time.Second).Get(subURL.String())
+	if err != nil { writeJSON(w, 502, map[string]string{"error": "could not download subscription: " + truncateError(err.Error())}); return }
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { writeJSON(w, 502, map[string]string{"error": fmt.Sprintf("subscription returned HTTP %d", resp.StatusCode)}); return }
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil { writeJSON(w, 502, map[string]string{"error": "could not read subscription"}); return }
+	cfg, err := readMihomoFileConfig()
+	if err != nil { writeJSON(w, 500, map[string]string{"error": err.Error()}); return }
+	proxies, ok := asMapSlice(cfg["proxies"])
+	if !ok { writeJSON(w, 500, map[string]string{"error": "mihomo config has an invalid proxies section"}); return }
+	existing := map[string]struct{}{}
+	for _, proxy := range proxies { if name, _ := proxy["name"].(string); name != "" { existing[name] = struct{}{} } }
+	type result struct { Line int `json:"line"`; Name string `json:"name,omitempty"`; Status string `json:"status"`; Error string `json:"error,omitempty"` }
+	results := []result{}
+	addedNames := []string{}
+	for index, line := range strings.Split(decodeSubscriptionPayload(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" { continue }
+		if !strings.HasPrefix(strings.ToLower(line), "vless://") { results = append(results, result{Line:index+1, Status:"unsupported", Error:"only vless subscription nodes are currently supported"}); continue }
+		proxy, name, parseErr := subscriptionVLESS(line)
+		if parseErr != nil { results = append(results, result{Line:index+1, Status:"skipped", Error:parseErr.Error()}); continue }
+		if _, exists := existing[name]; exists { results = append(results, result{Line:index+1, Name:name, Status:"duplicate"}); continue }
+		proxies = append(proxies, proxy); existing[name] = struct{}{}; addedNames = append(addedNames, name)
+		appendGroupMember(cfg, "Auto", name); appendGroupMember(cfg, subscriptionGroup(name), name)
+		results = append(results, result{Line:index+1, Name:name, Status:"imported"})
+	}
+	if len(addedNames) == 0 { writeJSON(w, 200, map[string]any{"results":results, "imported":0}); return }
+	cfg["proxies"] = make([]any, len(proxies)); for i, proxy := range proxies { cfg["proxies"].([]any)[i] = proxy }
+	if err := writeMihomoFileConfig(cfg); err != nil { writeJSON(w, 500, map[string]string{"error":err.Error()}); return }
+	if err := a.reloadMihomoConfig(); err != nil { writeJSON(w, 502, map[string]string{"error":err.Error()}); return }
+	for _, name := range addedNames { _, _ = a.insertProxy(ProxyRecord{Scheme:"mihomo", Host:name, Enabled:true, HealthStatus:"unknown", URI:"mihomo://"+name, CreatedAt:time.Now().UTC()}) }
+	a.runBackground(a.runUnverifiedHealthCheck)
+	writeJSON(w, 200, map[string]any{"results":results, "imported":len(addedNames)})
+}
+
 func (a *App) importProxies(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Text          string `json:"text"`
@@ -3870,23 +4216,46 @@ func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
 	a.invalidateProxyCache()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
+func (a *App) deleteProxyRecord(id int64) (bool, error) {
+	var scheme, host string
+	err := a.db.QueryRow("SELECT scheme,host FROM proxies WHERE id=?", id).Scan(&scheme, &host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if scheme == "mihomo" {
+		if err := a.removeMihomoNode(host); err != nil {
+			return false, fmt.Errorf("could not remove mihomo node %q: %w", host, err)
+		}
+	}
+	res, err := a.db.Exec("DELETE FROM proxies WHERE id=?", id)
+	if err != nil {
+		return false, err
+	}
+	deleted, _ := res.RowsAffected()
+	if deleted > 0 {
+		a.invalidateProxyCache()
+	}
+	return deleted > 0, nil
+}
+
 func (a *App) deleteProxy(w http.ResponseWriter, r *http.Request) {
 	id, e := a.proxyID(r)
 	if e != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid id"})
 		return
 	}
-	res, e := a.db.Exec("DELETE FROM proxies WHERE id=?", id)
+	deleted, e := a.deleteProxyRecord(id)
 	if e != nil {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	if !deleted {
 		writeJSON(w, 404, map[string]string{"error": "proxy not found"})
 		return
 	}
-	a.invalidateProxyCache()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -3925,16 +4294,10 @@ func (a *App) bulkDeleteProxies(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "too many proxy ids"})
 		return
 	}
-	tx, err := a.db.Begin()
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not delete proxies"})
-		return
-	}
 	seen := make(map[int64]struct{}, len(ids))
 	deleted := int64(0)
 	for _, id := range ids {
 		if id <= 0 {
-			_ = tx.Rollback()
 			writeJSON(w, 400, map[string]string{"error": "invalid proxy id"})
 			return
 		}
@@ -3942,21 +4305,14 @@ func (a *App) bulkDeleteProxies(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[id] = struct{}{}
-		res, deleteErr := tx.Exec("DELETE FROM proxies WHERE id=?", id)
+		removed, deleteErr := a.deleteProxyRecord(id)
 		if deleteErr != nil {
-			_ = tx.Rollback()
-			writeJSON(w, 500, map[string]string{"error": "could not delete proxies"})
+			writeJSON(w, 500, map[string]string{"error": deleteErr.Error()})
 			return
 		}
-		count, _ := res.RowsAffected()
-		deleted += count
-	}
-	if err = tx.Commit(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not delete proxies"})
-		return
-	}
-	if deleted > 0 {
-		a.invalidateProxyCache()
+		if removed {
+			deleted++
+		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "deleted": deleted})
 }
@@ -3969,8 +4325,9 @@ func (a *App) testProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	var p ProxyRecord
 	var en, lastOK int
+	var latency int64
 	var encrypted, expires, checked, created string
-	queryErr := a.db.QueryRow("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,created_at FROM proxies WHERE id=?", id).Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &expires, &checked, &lastOK, &created)
+	queryErr := a.db.QueryRow("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE id=?", id).Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &expires, &checked, &lastOK, &latency, &created)
 	if errors.Is(queryErr, sql.ErrNoRows) {
 		writeJSON(w, 404, map[string]string{"error": "proxy not found"})
 		return
@@ -3993,13 +4350,21 @@ func (a *App) testProxy(w http.ResponseWriter, r *http.Request) {
 		p.ExpiresAt = &t
 	}
 	p.Enabled = en == 1
+	p.LastCheckOK = lastOK == 1
+	if latency >= 0 {
+		p.LastLatencyMS = &latency
+	}
 	p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 	p.Password, _ = a.decrypt(encrypted)
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
 	var resp *http.Response
 	if e == nil {
-		req, _ := http.NewRequestWithContext(r.Context(), "GET", "https://api.ipify.org?format=json", nil)
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.ipify.org?format=json", nil)
 		resp, e = a.doProxyRequest(req, p)
 	}
+	latency := time.Since(started)
 	if resp != nil {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -4008,22 +4373,26 @@ func (a *App) testProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if e != nil {
-		a.markProxyFailure(id)
-		a.recordProxyCheck(id, false)
-		writeJSON(w, 502, map[string]any{"ok": false, "error": truncateError(e.Error())})
+		if errors.Is(e, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
+			a.markProxyTimeout(id)
+		} else {
+			a.markProxyFailure(id)
+		}
+		a.recordProxyCheck(id, false, latency)
+		writeJSON(w, 502, map[string]any{"ok": false, "timed_out": errors.Is(e, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded, "latency_ms": latency.Milliseconds(), "error": truncateError(e.Error())})
 		return
 	}
 	a.markProxySuccess(id)
-	a.recordProxyCheck(id, true)
-	writeJSON(w, 200, map[string]bool{"ok": true})
+	a.recordProxyCheck(id, true, latency)
+	writeJSON(w, 200, map[string]any{"ok": true, "latency_ms": latency.Milliseconds()})
 }
 
-func (a *App) recordProxyCheck(id int64, ok bool) {
+func (a *App) recordProxyCheck(id int64, ok bool, latency time.Duration) {
 	okValue := 0
 	if ok {
 		okValue = 1
 	}
-	if _, err := a.db.Exec("UPDATE proxies SET last_checked_at=?,last_check_ok=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), okValue, id); err != nil {
+	if _, err := a.db.Exec("UPDATE proxies SET last_checked_at=?,last_check_ok=?,last_latency_ms=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), okValue, latency.Milliseconds(), id); err != nil {
 		log.Printf("record proxy check failed: %v", err)
 	}
 }

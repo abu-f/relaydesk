@@ -28,8 +28,13 @@ services:
       WEB_DIR: /app/web/dist
       DATABASE_PATH: /data/app.db
       PORT: 8080
+      MIHOMO_CONFIG_PATH: /mihomo/config.yaml
     volumes:
       - opencode_data:/data
+      - ./mihomo/config.yaml:/mihomo/config.yaml
+    # The config bind mount is owned by the host; root is required only to
+    # update it while the container remains read-only elsewhere.
+    user: "0:0"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

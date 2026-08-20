@@ -55,6 +55,7 @@ type Proxy = {
   expires_at?: string;
   last_checked_at?: string;
   last_check_ok?: boolean;
+  last_latency_ms?: number;
 };
 type ProxyPage = {
   items: Proxy[];
@@ -107,7 +108,7 @@ type DailyUsage = {
   requests: number;
   tokens: number;
 };
-type ProxyFilterState = "all" | "unverified" | "healthy" | "cooldown" | "disabled";
+type ProxyFilterState = "all" | "unverified" | "healthy" | "cooldown" | "timeout" | "disabled";
 type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
 type UsageFilters = {
   time: UsageTimePreset;
@@ -662,6 +663,7 @@ function Proxies({
 }) {
 	const documentVisible = useDocumentVisible();
 	const [text, setText] = useState("");
+  const [subscriptionURL, setSubscriptionURL] = useState("");
   const [expiry, setExpiry] = useState("0");
   const [customExpiry, setCustomExpiry] = useState("");
   const [proxies, setProxies] = useState<Proxy[]>([]);
@@ -687,6 +689,8 @@ function Proxies({
   const [testResult, setTestResult] = useState<{
     id: number;
     ok: boolean;
+    latency_ms?: number;
+    timed_out?: boolean;
     error?: string;
   } | null>(null);
 	const [nowTick, setNowTick] = useState(Date.now());
@@ -839,6 +843,24 @@ function Proxies({
       setBusy(false);
     }
   };
+  const importSubscription = async () => {
+    const url = subscriptionURL.trim();
+    if (!url) return;
+    setBusy(true);
+    try {
+      const d = await api("/api/proxies/import-subscription", {
+        method: "POST",
+        body: JSON.stringify({ subscription_url: url }),
+      });
+      notify(`订阅导入完成：新增 ${d.imported ?? 0} 个节点`);
+      setSubscriptionURL("");
+      await refreshAfterMutation(1);
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const importMihomo = async () => {
     setBusy(true);
     try {
@@ -860,9 +882,9 @@ function Proxies({
     setTestingId(p.id);
     setTestResult(null);
     try {
-      await api(`/api/proxies/${p.id}/test`, { method: "POST" });
-      setTestResult({ id: p.id, ok: true });
-      notify("测试通过");
+      const d = await api(`/api/proxies/${p.id}/test`, { method: "POST" });
+      setTestResult({ id: p.id, ok: true, latency_ms: d.latency_ms });
+      notify(`测试通过${d.latency_ms !== undefined ? ` · ${d.latency_ms}ms` : ""}`);
       await refreshAfterMutation();
     } catch (e) {
       setTestResult({ id: p.id, ok: false, error: (e as Error).message });
@@ -942,6 +964,8 @@ function Proxies({
     if (!proxy.enabled) return { label: "已禁用", className: "disabled" };
     if (proxy.health_status === "unknown")
       return { label: "未验证", className: "unknown" };
+    if (proxy.health_status === "timeout")
+      return { label: "超时", className: "timeout" };
     if (proxy.usage_state === "cooldown")
       return { label: "冷却中", className: "cooldown" };
     if (proxy.usage_state === "in_use")
@@ -979,10 +1003,24 @@ function Proxies({
               </div>
             </div>
             <div className="pool-stat">
+              <span className="pool-stat-dot timeout" />
+              <div>
+                <strong>{hcStatus.timeout_proxies ?? "—"}</strong>
+                <small>超时</small>
+              </div>
+            </div>
+            <div className="pool-stat">
               <span className="pool-stat-dot unknown" />
               <div>
                 <strong>{hcStatus.unknown_proxies ?? "—"}</strong>
                 <small>未验证</small>
+              </div>
+            </div>
+            <div className="pool-stat">
+              <span className="pool-stat-dot disabled" />
+              <div>
+                <strong>{hcStatus.disabled_proxies ?? "—"}</strong>
+                <small>禁用</small>
               </div>
             </div>
           </div>
@@ -1190,6 +1228,21 @@ function Proxies({
           </div>
           <Upload size={20} />
         </div>
+        <label className="subscription-import">
+          <span>机场订阅地址</span>
+          <div className="subscription-import-row">
+            <input
+              type="url"
+              value={subscriptionURL}
+              onChange={(e) => setSubscriptionURL(e.target.value)}
+              placeholder="https://example.com/subscription"
+            />
+            <button className="secondary" onClick={importSubscription} disabled={busy || !subscriptionURL.trim()}>
+              从订阅导入
+            </button>
+          </div>
+          <small className="field-help">自动下载并解析 vless 节点，写入 Mihomo 对应地区分组和当前代理池。</small>
+        </label>
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -1254,6 +1307,7 @@ function Proxies({
                 <option value="unverified">未验证</option>
                 <option value="healthy">健康</option>
                 <option value="cooldown">冷却中</option>
+                <option value="timeout">超时</option>
                 <option value="disabled">禁用</option>
               </select>
             </label>
@@ -1340,6 +1394,7 @@ function Proxies({
                         p.last_check_ok ? " 验证通过" : " 验证失败"
                       }`
                     : "未检查"}
+                  {p.last_latency_ms !== undefined ? ` · ${p.last_latency_ms}ms` : ""}
                 </small>
               </span>
               <span>{p.failure_count}</span>
@@ -1349,7 +1404,9 @@ function Proxies({
                     className={`test-feedback ${testResult.ok ? "ok" : "fail"}`}
                     title={testResult.error || ""}
                   >
-                    {testResult.ok ? "通过" : "失败"}
+                    {testResult.ok
+                      ? `通过${testResult.latency_ms !== undefined ? ` · ${testResult.latency_ms}ms` : ""}`
+                      : "失败"}
                   </span>
                 )}
                 <button
