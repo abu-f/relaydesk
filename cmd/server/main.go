@@ -4447,14 +4447,11 @@ func (a *App) runLatencyTest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state must be all, unverified, healthy, cooldown, timeout, disabled, unused, or in_use"})
 		return
 	}
-	// Only probe enabled nodes; "all" returns an empty WHERE clause so append
-	// the enabled filter explicitly. Disabled nodes are out of scope for a
-	// latency probe by design.
-	if where == "" {
-		where = " WHERE p.enabled=1"
-	} else {
-		where += " AND p.enabled=1"
-	}
+	// Probe exactly what the "当前路径" table shows: the same filter state. This
+	// intentionally includes disabled nodes (e.g. state=all or state=disabled)
+	// so the operator can evaluate whether a disabled proxy is still reachable
+	// and worth re-enabling. Filtering states that already imply enabled=1
+	// (healthy/cooldown/timeout/unused/in_use/unverified) keep that scope.
 
 	page, err := parseProxyPageParam(query["page"], 1, 1, 1_000_000)
 	if err != nil {
@@ -4552,12 +4549,19 @@ func (a *App) runLatencyTest(w http.ResponseWriter, r *http.Request) {
 			failed++
 		}
 		mu.Unlock()
-		if result.OK {
-			a.markProxySuccess(p.ID)
-		} else if result.TimedOut {
-			a.markProxyTimeout(p.ID)
-		} else {
-			a.markProxyCheckFailed(p.ID)
+		// Always record the measured latency/check time so the operator can see
+		// how every node (including disabled ones) performs against Google.
+		// Only mutate health_status/cooldown/failure_count for enabled nodes:
+		// a disabled proxy should not flip to "healthy"/"timeout"/"cooldown"
+		// merely because we probed it; it stays disabled until re-enabled.
+		if p.Enabled {
+			if result.OK {
+				a.markProxySuccess(p.ID)
+			} else if result.TimedOut {
+				a.markProxyTimeout(p.ID)
+			} else {
+				a.markProxyCheckFailed(p.ID)
+			}
 		}
 		a.recordProxyCheck(p.ID, result.OK, result.Latency)
 	}

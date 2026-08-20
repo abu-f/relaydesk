@@ -1364,7 +1364,7 @@ function Proxies({
               className="secondary"
               onClick={runLatencyTest}
               disabled={busy || loading || latencyBusy || !proxies.length}
-              title="对谷歌测延时（当前筛选范围）"
+              title="对谷歌测延时（当前筛选范围内全部节点，含禁用节点）"
             >
               <CircleGauge size={14} />
               {latencyBusy ? "测延时中…" : "测延时"}
