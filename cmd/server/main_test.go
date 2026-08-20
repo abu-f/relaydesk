@@ -606,9 +606,9 @@ func TestVisionUseProxySettingAndDirectTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, ok := client.Transport.(*http.Transport)
-	if !ok || transport.Proxy != nil {
-		t.Fatal("empty proxy record did not configure a direct transport")
+	transport, ok := client.Transport.(*splitHTTPSTransport)
+	if !ok || transport.httpTransport.Proxy != nil || transport.httpsTransport.Proxy != nil {
+		t.Fatal("empty proxy record did not configure direct split transports")
 	}
 }
 

@@ -2665,14 +2665,11 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 			return client, nil
 		}
 	}
-	tr := baseTransport()
-	if strings.TrimSpace(p.URI) == "" {
-		return &http.Client{Transport: tr}, nil
-	}
-	if err := configureProxyTransport(tr, p.URI, p.Username, p.Password); err != nil {
+	proxyURL, err := proxyURLForRecord(p)
+	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Transport: tr}
+	client := &http.Client{Transport: newSplitTransport(proxyURL)}
 	if p.ID > 0 {
 		a.proxyCacheMu.Lock()
 		if a.clientCache == nil {
@@ -2680,7 +2677,7 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 		}
 		if cached := a.clientCache[p.ID]; cached != nil {
 			a.proxyCacheMu.Unlock()
-			tr.CloseIdleConnections()
+			client.Transport.(interface{ CloseIdleConnections() }).CloseIdleConnections()
 			return cached, nil
 		}
 		a.clientCache[p.ID] = client
@@ -2699,7 +2696,21 @@ func baseTransport() *http.Transport {
 }
 
 func directHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Transport: baseTransport(), Timeout: timeout}
+	return &http.Client{Transport: newSplitTransport(nil), Timeout: timeout}
+}
+
+func proxyURLForRecord(p ProxyRecord) (*url.URL, error) {
+	if strings.TrimSpace(p.URI) == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(p.URI)
+	if err != nil {
+		return nil, err
+	}
+	if p.Username != "" {
+		u.User = url.UserPassword(p.Username, p.Password)
+	}
+	return u, nil
 }
 
 func configureProxyTransport(tr *http.Transport, proxyURI, username, password string) error {
@@ -2743,11 +2754,11 @@ func (a *App) mihomoClient(p ProxyRecord) (*http.Client, error) {
 	if err := switchMihomoNode(cfg, p.Host); err != nil {
 		return nil, err
 	}
-	tr := baseTransport()
-	if err := configureProxyTransport(tr, cfg.EntryProxy, "", ""); err != nil {
+	entryProxy, err := url.Parse(cfg.EntryProxy)
+	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Transport: tr}, nil
+	return &http.Client{Transport: newSplitTransport(entryProxy)}, nil
 }
 func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
@@ -3196,7 +3207,7 @@ func (a *App) invalidateProxyCache() {
 	a.proxyVersion.Add(1)
 	a.proxyCacheMu.Lock()
 	for _, client := range a.clientCache {
-		if transport, ok := client.Transport.(*http.Transport); ok {
+		if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
 			transport.CloseIdleConnections()
 		}
 	}
