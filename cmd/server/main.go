@@ -1180,27 +1180,30 @@ func (a *App) unverifiedCheckLoop() {
 }
 
 func (a *App) healthCheckTargets() (method, testURL string, payload []byte) {
-	method, testURL, payload = "GET", a.healthcheckTestURL(), []byte(nil)
-	if testURL == "" {
-		cfg, _ := a.loadUpstream()
-		if cfg.BaseURL != "" {
-			var model string
-			if a.db.QueryRow("SELECT model_id FROM models WHERE is_free=1 ORDER BY model_id LIMIT 1").Scan(&model) == nil && model != "" {
-				method = "POST"
-				testURL = upstreamEndpoint(cfg.BaseURL, "/chat/completions")
-				payload, _ = json.Marshal(map[string]any{
-					"model":      model,
-					"messages":   []map[string]string{{"role": "user", "content": "ping"}},
-					"max_tokens": 1,
-					"stream":     false,
-				})
-			}
-		}
-		if testURL == "" {
-			testURL = "https://www.gstatic.com/generate_204"
+	// Prefer a real chat/completions probe over a simple connectivity URL so
+	// that proxies whose IPs are 429-rate-limited are correctly marked unhealthy.
+	cfg, _ := a.loadUpstream()
+	if cfg.BaseURL != "" {
+		var model string
+		if a.db.QueryRow("SELECT model_id FROM models WHERE is_free=1 ORDER BY model_id LIMIT 1").Scan(&model) == nil && model != "" {
+			method = "POST"
+			testURL = upstreamEndpoint(cfg.BaseURL, "/chat/completions")
+			payload, _ = json.Marshal(map[string]any{
+				"model":      model,
+				"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+				"max_tokens": 1,
+				"stream":     false,
+			})
+			return method, testURL, payload
 		}
 	}
-	return method, testURL, payload
+	// Fallback: user-configured test URL or gstatic 204.
+	testURL = strings.TrimSpace(a.healthcheckTestURL())
+	if testURL == "" {
+		testURL = "https://www.gstatic.com/generate_204"
+	}
+	method = "GET"
+	return method, testURL, nil
 }
 
 const healthCheckConcurrency = 10
@@ -1371,6 +1374,14 @@ func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []
 		return false
 	}
 	req.Header.Set("User-Agent", "relaydesk-healthcheck/1.0")
+	// When testing the upstream chat/completions endpoint, attach the real
+	// upstream credentials so a 429 quota error (not a 200) is what marks the
+	// proxy as unhealthy for actual forwarding.
+	if payload != nil && strings.Contains(testURL, "/chat/completions") {
+		if cfg, e := a.loadUpstream(); e == nil {
+			applyUpstreamHeaders(req, cfg)
+		}
+	}
 	resp, err := a.doProxyRequest(req, p)
 	if err != nil {
 		return false
