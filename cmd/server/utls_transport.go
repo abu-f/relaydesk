@@ -193,10 +193,35 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 	if err != nil {
 		return nil, err
 	}
+	standardConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+	if baseConfig != nil {
+		standardConfig = baseConfig.Clone()
+		if standardConfig.ServerName == "" {
+			standardConfig.ServerName = host
+		}
+		if len(standardConfig.NextProtos) == 0 {
+			standardConfig.NextProtos = []string{"h2", "http/1.1"}
+		}
+	}
+
+	// First attempt: standard Go TLS. Direct connections and curl-equivalent
+	// behaviour work fine through SOCKS5/HTTP proxies with the default
+	// ClientHello, so prefer it and only fall back to uTLS when Cloudflare
+	// style fingerprinting is actually detected.
 	conn, err := route.dial(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
+	standard := tls.Client(conn, standardConfig)
+	if err := standard.HandshakeContext(ctx); err == nil {
+		return standard, nil
+	} else {
+		conn.Close()
+		log.Printf("standard TLS handshake failed for %s via %s; retrying with uTLS: %v", host, routeLabel(route), err)
+	}
+
+	// Second attempt: uTLS with a spoofed browser fingerprint, useful when the
+	// upstream (e.g. Cloudflare) blocks Go's default ClientHello.
 	config := &utls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	if baseConfig != nil {
 		config.RootCAs = baseConfig.RootCAs
@@ -211,33 +236,16 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 			config.NextProtos = append([]string(nil), baseConfig.NextProtos...)
 		}
 	}
+	conn, err = route.dial(ctx, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("standard TLS failed (%v) and uTLS reconnect failed: %w", err, err)
+	}
 	client := utls.UClient(conn, config, utls.HelloChrome_Auto)
 	if err := client.HandshakeContext(ctx); err == nil {
 		return &utlsNetConn{UConn: client, state: standardConnectionState(client.ConnectionState())}, nil
-	} else {
-		conn.Close()
-		log.Printf("uTLS handshake failed for %s via %s; retrying with standard TLS: %v", host, routeLabel(route), err)
 	}
-	conn, err = route.dial(ctx, network, address)
-	if err != nil {
-		return nil, fmt.Errorf("uTLS failed and standard TLS reconnect failed: %w", err)
-	}
-	standardConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
-	if baseConfig != nil {
-		standardConfig = baseConfig.Clone()
-		if standardConfig.ServerName == "" {
-			standardConfig.ServerName = host
-		}
-		if len(standardConfig.NextProtos) == 0 {
-			standardConfig.NextProtos = []string{"h2", "http/1.1"}
-		}
-	}
-	standard := tls.Client(conn, standardConfig)
-	if err := standard.HandshakeContext(ctx); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("uTLS handshake failed (%v); standard TLS handshake failed: %w", err, err)
-	}
-	return standard, nil
+	conn.Close()
+	return nil, fmt.Errorf("standard TLS and uTLS handshake both failed for %s", host)
 }
 
 func routeLabel(route routedDialer) string {
