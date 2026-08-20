@@ -62,7 +62,17 @@ type App struct {
 	hcDuration    time.Duration
 	hcPassed      int
 	hcFailed      int
+	latencyMu     sync.Mutex
 }
+
+// latencyProbeURL is the Google endpoint used by the "测延时" action. It
+// returns HTTP 204 with an empty body, ideal for measuring round-trip latency
+// through a proxy without downloading content.
+const latencyProbeURL = "https://www.google.com/generate_204"
+
+// latencyProbeTimeout caps each per-proxy latency probe so a slow or dead
+// proxy does not stall the whole batch.
+const latencyProbeTimeout = 8 * time.Second
 
 type loginAttempt struct {
 	Failures     int
@@ -677,6 +687,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/proxies/import", a.requireAdmin(a.importProxies))
 	mux.HandleFunc("POST /api/proxies/import-subscription", a.requireAdmin(a.importSubscription))
 	mux.HandleFunc("POST /api/proxies/bulk-delete", a.requireAdmin(a.bulkDeleteProxies))
+	mux.HandleFunc("POST /api/proxies/latency-test", a.requireAdmin(a.runLatencyTest))
 	mux.HandleFunc("PATCH /api/proxies/{id}", a.requireAdmin(a.patchProxy))
 	mux.HandleFunc("DELETE /api/proxies/{id}", a.requireAdmin(a.deleteProxy))
 	mux.HandleFunc("POST /api/proxies/{id}/test", a.requireAdmin(a.testProxy))
@@ -1230,6 +1241,10 @@ func (a *App) healthCheckTargets() (method, testURL string, payload []byte) {
 
 const healthCheckConcurrency = 10
 
+// healthCheckProbeTimeout is the per-proxy timeout for the periodic health
+// check (separate from the shorter latency-test probe).
+const healthCheckProbeTimeout = 15 * time.Second
+
 func (a *App) runChecks(proxies []ProxyRecord, method, testURL string, payload []byte) (passed, failed int) {
 	if len(proxies) == 0 {
 		return 0, 0
@@ -1242,7 +1257,7 @@ func (a *App) runChecks(proxies []ProxyRecord, method, testURL string, payload [
 	var workersWG sync.WaitGroup
 	var mu sync.Mutex
 	check := func(p ProxyRecord) {
-		result := a.healthCheckProxy(p, method, testURL, payload)
+		result := a.healthCheckProxy(p, method, testURL, payload, healthCheckProbeTimeout)
 		mu.Lock()
 		if result.OK {
 			passed++
@@ -1391,9 +1406,9 @@ type proxyCheckResult struct {
 	Latency time.Duration
 }
 
-func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []byte) proxyCheckResult {
+func (a *App) healthCheckProxy(p ProxyRecord, method, testURL string, payload []byte, timeout time.Duration) proxyCheckResult {
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(a.appContext(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(a.appContext(), timeout)
 	defer cancel()
 	var req *http.Request
 	var err error
@@ -4408,6 +4423,166 @@ func (a *App) recordProxyCheck(id int64, ok bool, latency time.Duration) {
 	if _, err := a.db.Exec("UPDATE proxies SET last_checked_at=?,last_check_ok=?,last_latency_ms=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), okValue, latency.Milliseconds(), id); err != nil {
 		log.Printf("record proxy check failed: %v", err)
 	}
+}
+
+// runLatencyTest measures round-trip latency to a Google endpoint through each
+// proxy in the caller's current filter/page scope. Unlike the periodic health
+// check it is a synchronous, page-scoped action triggered by the "测延时" button
+// in the "当前路径" panel, and it only probes enabled nodes.
+func (a *App) runLatencyTest(w http.ResponseWriter, r *http.Request) {
+	if !a.latencyMu.TryLock() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "latency test already running"})
+		return
+	}
+	defer a.latencyMu.Unlock()
+
+	query := r.URL.Query()
+	state := strings.TrimSpace(query.Get("state"))
+	if state == "" {
+		state = "all"
+	}
+	now := time.Now().UTC()
+	where, args, ok := proxyFilterClause(state, now)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state must be all, unverified, healthy, cooldown, timeout, disabled, unused, or in_use"})
+		return
+	}
+	// Only probe enabled nodes; "all" returns an empty WHERE clause so append
+	// the enabled filter explicitly. Disabled nodes are out of scope for a
+	// latency probe by design.
+	if where == "" {
+		where = " WHERE p.enabled=1"
+	} else {
+		where += " AND p.enabled=1"
+	}
+
+	page, err := parseProxyPageParam(query["page"], 1, 1, 1_000_000)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "page must be an integer between 1 and 1000000"})
+		return
+	}
+	pageSize, err := parseProxyPageParam(query["page_size"], 50, 1, 200)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "page_size must be an integer between 1 and 200"})
+		return
+	}
+
+	var total int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM proxies p"+where, args...).Scan(&total); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not count proxies"})
+		return
+	}
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	offset := (page - 1) * pageSize
+	pageArgs := append(append([]any{}, args...), pageSize, offset)
+	// Inline scan+decrypt (mirrors allEnabledProxies) because scanProxies does
+	// not decrypt credentials, and authenticated HTTP/SOCKS proxies need the
+	// plaintext password to dial through the proxy during the probe.
+	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies p"+where+" ORDER BY p.id DESC LIMIT ? OFFSET ?", pageArgs...)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not query proxies"})
+		return
+	}
+	proxies := []ProxyRecord{}
+	for rows.Next() {
+		var p ProxyRecord
+		var en, lastOK int
+		var storedLatency int64
+		var cool, expires, checked, created, encrypted string
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &storedLatency, &created); err != nil {
+			_ = rows.Close()
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read proxies"})
+			return
+		}
+		p.Password, err = a.decrypt(encrypted)
+		if err != nil {
+			_ = rows.Close()
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not decrypt proxy credentials"})
+			return
+		}
+		p.Enabled = en == 1
+		p.LastCheckOK = lastOK == 1
+		if storedLatency >= 0 {
+			p.LastLatencyMS = &storedLatency
+		}
+		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		if cool != "" {
+			t, _ := time.Parse(time.RFC3339, cool)
+			p.CooldownUntil = &t
+		}
+		if expires != "" {
+			t, _ := time.Parse(time.RFC3339, expires)
+			p.ExpiresAt = &t
+		}
+		if checked != "" {
+			t, _ := time.Parse(time.RFC3339, checked)
+			p.LastCheckedAt = &t
+		}
+		proxies = append(proxies, p)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read proxies"})
+		return
+	}
+
+	checked, passed, failed, timedOut := 0, 0, 0, 0
+	workers := healthCheckConcurrency
+	if len(proxies) < workers {
+		workers = len(proxies)
+	}
+	jobs := make(chan ProxyRecord)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	probe := func(p ProxyRecord) {
+		result := a.healthCheckProxy(p, "GET", latencyProbeURL, nil, latencyProbeTimeout)
+		mu.Lock()
+		checked++
+		if result.OK {
+			passed++
+		} else if result.TimedOut {
+			timedOut++
+		} else {
+			failed++
+		}
+		mu.Unlock()
+		if result.OK {
+			a.markProxySuccess(p.ID)
+		} else if result.TimedOut {
+			a.markProxyTimeout(p.ID)
+		} else {
+			a.markProxyCheckFailed(p.ID)
+		}
+		a.recordProxyCheck(p.ID, result.OK, result.Latency)
+	}
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				probe(p)
+			}
+		}()
+	}
+	for _, p := range proxies {
+		jobs <- p
+	}
+	close(jobs)
+	wg.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"checked":   checked,
+		"passed":    passed,
+		"failed":    failed,
+		"timed_out": timedOut,
+	})
 }
 
 func (a *App) recordUsage(model string, proxyID *int64, proxyURI, status string, code int, lat time.Duration, firstTokenLatency *time.Duration, retries int, tokens any, e error) {

@@ -693,6 +693,7 @@ function Proxies({
     timed_out?: boolean;
     error?: string;
   } | null>(null);
+  const [latencyBusy, setLatencyBusy] = useState(false);
 	const [nowTick, setNowTick] = useState(Date.now());
 	useEffect(() => {
 		if (!documentVisible) return;
@@ -890,6 +891,27 @@ function Proxies({
       setTestResult({ id: p.id, ok: false, error: (e as Error).message });
     } finally {
       setTestingId(null);
+    }
+  };
+  const runLatencyTest = async () => {
+    if (!proxies.length) return;
+    setLatencyBusy(true);
+    try {
+      const params = new URLSearchParams();
+      if (proxyState !== "all") params.set("state", proxyState);
+      params.set("page", String(proxyPage));
+      params.set("page_size", String(Math.min(pageSize, 200)));
+      const d = await api(`/api/proxies/latency-test?${params.toString()}`, {
+        method: "POST",
+      });
+      notify(
+        `测延时完成：${d.checked} 个 · 通过 ${d.passed} · 超时 ${d.timed_out ?? 0} · 失败 ${d.failed}`,
+      );
+      await refreshAfterMutation();
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setLatencyBusy(false);
     }
   };
   const toggle = async (p: Proxy) => {
@@ -1337,6 +1359,15 @@ function Proxies({
             >
               <Trash2 size={14} />
               清理全部禁用
+            </button>
+            <button
+              className="secondary"
+              onClick={runLatencyTest}
+              disabled={busy || loading || latencyBusy || !proxies.length}
+              title="对谷歌测延时（当前筛选范围）"
+            >
+              <CircleGauge size={14} />
+              {latencyBusy ? "测延时中…" : "测延时"}
             </button>
             <span className="count-chip">{fmt(total)} 条</span>
           </div>
