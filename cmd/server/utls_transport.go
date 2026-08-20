@@ -173,17 +173,23 @@ func newSplitTransportWithTLSConfig(proxyURL *url.URL, tlsConfig *tls.Config) *s
 	base.Proxy = nil
 	base.DialContext = dialer.DialContext
 	base.ResponseHeaderTimeout = upstreamRequestTimeout
+	base.ForceAttemptHTTP2 = false
 
+	// For proxied HTTPS, let the standard library handle the proxy CONNECT
+	// tunnel and TLS. Direct connections (proxyURL == nil) use the custom
+	// DialTLSContext so uTLS fingerprinting can still apply if needed.
 	httpTr := base.Clone()
 	if proxyURL != nil {
 		httpTr.Proxy = http.ProxyURL(proxyURL)
 	}
 	httpsTr := base.Clone()
-	httpsTr.Proxy = nil
-	httpsTr.ForceAttemptHTTP2 = false
-	route := routedDialer{proxyURL: proxyURL, dialer: dialer}
-	httpsTr.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		return dialUTLS(ctx, route, network, address, tlsConfig)
+	if proxyURL != nil {
+		httpsTr.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		route := routedDialer{proxyURL: nil, dialer: dialer}
+		httpsTr.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialUTLS(ctx, route, network, address, tlsConfig)
+		}
 	}
 	return &splitHTTPSTransport{httpTransport: httpTr, httpsTransport: httpsTr, tlsConfig: tlsConfig}
 }
