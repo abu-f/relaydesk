@@ -3764,14 +3764,10 @@ func writeMihomoFileConfig(cfg mihomoFileConfig) error {
 	if err != nil {
 		return fmt.Errorf("encode mihomo config: %w", err)
 	}
-	path := mihomoConfigPath()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// The config is a Docker bind-mounted file. Replacing it with rename would
+	// detach the mount, so overwrite the mounted file in place instead.
+	if err := os.WriteFile(mihomoConfigPath(), data, 0644); err != nil {
 		return fmt.Errorf("write mihomo config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace mihomo config: %w", err)
 	}
 	return nil
 }
