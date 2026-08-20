@@ -3810,33 +3810,42 @@ func removeString(values []string, target string) []string {
 	return out
 }
 
-func asMapSlice(value any) ([]map[string]any, bool) {
-	items, ok := value.([]any)
-	if !ok {
+func asAnySlice(value any) ([]any, bool) {
+	switch items := value.(type) {
+	case []any:
+		return items, true
+	case []map[string]any:
+		out := make([]any, len(items))
+		for i, item := range items { out[i] = item }
+		return out, true
+	case []string:
+		out := make([]any, len(items))
+		for i, item := range items { out[i] = item }
+		return out, true
+	default:
 		return nil, false
 	}
+}
+
+func asMapSlice(value any) ([]map[string]any, bool) {
+	items, ok := asAnySlice(value)
+	if !ok { return nil, false }
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		mapped, ok := item.(map[string]any)
-		if !ok {
-			return nil, false
-		}
+		if !ok { return nil, false }
 		out = append(out, mapped)
 	}
 	return out, true
 }
 
 func asStringSlice(value any) ([]string, bool) {
-	items, ok := value.([]any)
-	if !ok {
-		return nil, false
-	}
+	items, ok := asAnySlice(value)
+	if !ok { return nil, false }
 	out := make([]string, 0, len(items))
 	for _, item := range items {
 		text, ok := item.(string)
-		if !ok {
-			return nil, false
-		}
+		if !ok { return nil, false }
 		out = append(out, text)
 	}
 	return out, true
@@ -3872,7 +3881,7 @@ func (a *App) removeMihomoNode(name string) error {
 		return nil
 	}
 	cfg["proxies"] = remaining
-	if groups, ok := cfg["proxy-groups"].([]any); ok {
+	if groups, ok := asAnySlice(cfg["proxy-groups"]); ok {
 		for _, item := range groups {
 			group, ok := item.(map[string]any)
 			if !ok {
@@ -4044,7 +4053,7 @@ func subscriptionGroup(name string) string {
 }
 
 func appendGroupMember(cfg mihomoFileConfig, groupName, nodeName string) {
-	groups, ok := cfg["proxy-groups"].([]any)
+	groups, ok := asAnySlice(cfg["proxy-groups"])
 	if !ok { return }
 	for _, item := range groups {
 		group, ok := item.(map[string]any)
