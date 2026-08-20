@@ -1355,9 +1355,9 @@ func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
-		var latency int64
+		var storedLatency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &storedLatency, &created); err != nil {
 			return nil, err
 		}
 		p.Password, err = a.decrypt(encrypted)
@@ -1366,8 +1366,8 @@ func (a *App) allEnabledProxies() ([]ProxyRecord, error) {
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
-		if latency >= 0 {
-			p.LastLatencyMS = &latency
+		if storedLatency >= 0 {
+			p.LastLatencyMS = &storedLatency
 		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if checked != "" {
@@ -3310,9 +3310,9 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
-		var latency int64
+		var storedLatency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &storedLatency, &created); err != nil {
 			return nil, err
 		}
 		p.Password, err = a.decrypt(encrypted)
@@ -3321,8 +3321,8 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
-		if latency >= 0 {
-			p.LastLatencyMS = &latency
+		if storedLatency >= 0 {
+			p.LastLatencyMS = &storedLatency
 		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if checked != "" {
@@ -3663,15 +3663,15 @@ func scanProxies(rows *sql.Rows) ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en, lastOK int
-		var latency int64
+		var storedLatency int64
 		var cool, expires, checked, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &latency, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &checked, &lastOK, &storedLatency, &created); err != nil {
 			return nil, err
 		}
 		p.Enabled = en == 1
 		p.LastCheckOK = lastOK == 1
-		if latency >= 0 {
-			p.LastLatencyMS = &latency
+		if storedLatency >= 0 {
+			p.LastLatencyMS = &storedLatency
 		}
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 		if cool != "" {
@@ -4325,9 +4325,9 @@ func (a *App) testProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	var p ProxyRecord
 	var en, lastOK int
-	var latency int64
+	var storedLatency int64
 	var encrypted, expires, checked, created string
-	queryErr := a.db.QueryRow("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE id=?", id).Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &expires, &checked, &lastOK, &latency, &created)
+	queryErr := a.db.QueryRow("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(expires_at,''),COALESCE(last_checked_at,''),last_check_ok,COALESCE(last_latency_ms,-1),created_at FROM proxies WHERE id=?", id).Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &expires, &checked, &lastOK, &storedLatency, &created)
 	if errors.Is(queryErr, sql.ErrNoRows) {
 		writeJSON(w, 404, map[string]string{"error": "proxy not found"})
 		return
@@ -4351,8 +4351,8 @@ func (a *App) testProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Enabled = en == 1
 	p.LastCheckOK = lastOK == 1
-	if latency >= 0 {
-		p.LastLatencyMS = &latency
+	if storedLatency >= 0 {
+		p.LastLatencyMS = &storedLatency
 	}
 	p.CreatedAt, _ = time.Parse(time.RFC3339, created)
 	p.Password, _ = a.decrypt(encrypted)
