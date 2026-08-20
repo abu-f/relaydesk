@@ -3650,6 +3650,9 @@ func parseProxy(raw string) (ProxyRecord, error) {
 		}
 		return ProxyRecord{Scheme: "mihomo", Host: name, Port: 0, Enabled: true, HealthStatus: "unknown", URI: "mihomo://" + name, CreatedAt: time.Now().UTC()}, nil
 	}
+	if strings.EqualFold(trimmed, "direct://") || strings.EqualFold(trimmed, "direct") {
+		return ProxyRecord{Scheme: "direct", Host: "local", Port: 0, Enabled: true, HealthStatus: "unknown", URI: "", CreatedAt: time.Now().UTC()}, nil
+	}
 	u, e := url.Parse(trimmed)
 	if e != nil || u.Hostname() == "" {
 		return ProxyRecord{}, fmt.Errorf("invalid proxy")
