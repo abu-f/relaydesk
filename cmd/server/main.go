@@ -160,6 +160,15 @@ func normalizeMihomoType(t string) string {
 	return b.String()
 }
 
+func containsString(list []string, target string) bool {
+	for _, s := range list {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}
+
 type usageRequest struct {
 	ID                  int64     `json:"id"`
 	CreatedAt           time.Time `json:"created_at"`
@@ -1793,15 +1802,16 @@ func hasMihomoInfoMarker(name string) bool {
 	return false
 }
 
-func switchMihomoNode(cfg mihomoConfig, nodeName string) error {
-	if cfg.ControlURL == "" {
-		return errors.New("mihomo control_url is not configured")
-	}
-	selector := cfg.Selector
-	if selector == "" {
-		selector = defaultMihomoSelector
-	}
-	body, _ := json.Marshal(map[string]string{"name": nodeName})
+// mihomoProxyInfo describes a single proxy or group as reported by mihomo.
+type mihomoProxyInfo struct {
+	Type string   `json:"type"`
+	All  []string `json:"all"`
+	Now  string   `json:"now"`
+}
+
+// putMihomoSelector sends a PUT to switch the named selector group to target.
+func putMihomoSelector(cfg mihomoConfig, selector, target string) error {
+	body, _ := json.Marshal(map[string]string{"name": target})
 	req, err := http.NewRequest("PUT", cfg.ControlURL+"/proxies/"+url.PathEscape(selector), bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -1812,13 +1822,95 @@ func switchMihomoNode(cfg mihomoConfig, nodeName string) error {
 	}
 	resp, err := directHTTPClient(10 * time.Second).Do(req)
 	if err != nil {
-		return fmt.Errorf("mihomo switch failed: %w", err)
+		return fmt.Errorf("mihomo switch %s failed: %w", selector, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("mihomo switch %s failed: HTTP %d", selector, resp.StatusCode)
+	}
+	return nil
+}
+
+// getMihomoProxy fetches a single proxy/group info from mihomo.
+func getMihomoProxy(cfg mihomoConfig, name string) (mihomoProxyInfo, error) {
+	req, err := http.NewRequest("GET", cfg.ControlURL+"/proxies/"+url.PathEscape(name), nil)
+	if err != nil {
+		return mihomoProxyInfo{}, err
+	}
+	if cfg.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
+	}
+	resp, err := directHTTPClient(10 * time.Second).Do(req)
+	if err != nil {
+		return mihomoProxyInfo{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("mihomo switch failed: HTTP %d", resp.StatusCode)
+		return mihomoProxyInfo{}, fmt.Errorf("mihomo get %s: HTTP %d", name, resp.StatusCode)
 	}
-	return nil
+	var info mihomoProxyInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return mihomoProxyInfo{}, fmt.Errorf("mihomo get %s: %w", name, err)
+	}
+	return info, nil
+}
+
+// switchMihomoNode routes traffic for the given node through the configured
+// selector. When the selector is a flat group that contains the node directly
+// it switches in one step. When the selector only references sub-groups (for
+// example "Proxy" -> ["Auto","Japan",...]) it walks the sub-groups to find the
+// one that contains the node, switches the selector to that sub-group, and —
+// when the sub-group is itself a manual Selector — switches it to the node.
+func switchMihomoNode(cfg mihomoConfig, nodeName string) error {
+	if cfg.ControlURL == "" {
+		return errors.New("mihomo control_url is not configured")
+	}
+	selector := cfg.Selector
+	if selector == "" {
+		selector = defaultMihomoSelector
+	}
+
+	// Fast path: try switching the selector directly to the node. This works
+	// when the selector is a flat group listing every proxy.
+	if err := putMihomoSelector(cfg, selector, nodeName); err == nil {
+		return nil
+	}
+
+	// Slow path: the selector references sub-groups. Look up its members and
+	// find the sub-group that contains the target node.
+	selInfo, err := getMihomoProxy(cfg, selector)
+	if err != nil {
+		return fmt.Errorf("mihomo selector %s lookup failed: %w", selector, err)
+	}
+	for _, member := range selInfo.All {
+		if member == nodeName {
+			// The node itself is a direct member; the fast path should have
+			// handled it, so this is a defensive no-op.
+			return nil
+		}
+		memberInfo, err := getMihomoProxy(cfg, member)
+		if err != nil {
+			continue
+		}
+		if !containsString(memberInfo.All, nodeName) {
+			continue
+		}
+		// Found the sub-group containing the node. Route the selector to it.
+		if err := putMihomoSelector(cfg, selector, member); err != nil {
+			return fmt.Errorf("mihomo switch %s -> %s failed: %w", selector, member, err)
+		}
+		// If the sub-group is a manual Selector, pin it to the target node so
+		// url-test/auto groups do not override the choice. url-test groups
+		// cannot be switched and already route to the lowest-latency member.
+		if normalizeMihomoType(memberInfo.Type) == "selector" {
+			if err := putMihomoSelector(cfg, member, nodeName); err != nil {
+				return fmt.Errorf("mihomo switch %s -> %s failed: %w", member, nodeName, err)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("mihomo node %q not found in selector %s or its sub-groups", nodeName, selector)
 }
 
 func normalizeAPIKey(raw string) string {
