@@ -1481,6 +1481,12 @@ function Models({
       } catch {
         /* 未配置 mihomo 时静默 */
       }
+      try {
+        const d = await api("/api/settings/client-key");
+        if (d.client_key) setClientKey(d.client_key);
+      } catch {
+        /* 未配置 client key 时静默 */
+      }
     })();
   }, []);
   useEffect(() => {
@@ -1779,7 +1785,7 @@ function Models({
           )}
           <p className="muted small">
             这是给 OpenCode 客户端使用的网关 Key，以 ocp- 开头；不要把它填入上游
-            API Key。Key 只在生成后展示一次。
+            API Key。Key 会一直显示在此处，轮换后旧 Key 立即失效。
           </p>
         </div>
       </section>

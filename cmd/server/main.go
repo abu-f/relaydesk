@@ -664,6 +664,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings/healthcheck", a.requireAdmin(a.putHealthCheck))
 	mux.HandleFunc("POST /api/settings/healthcheck/run", a.requireAdmin(a.runHealthCheckNow))
 	mux.HandleFunc("POST /api/settings/healthcheck/run-unverified", a.requireAdmin(a.runUnverifiedNow))
+	mux.HandleFunc("GET /api/settings/client-key", a.requireAdmin(a.getClientKey))
 	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.rotateClientKey))
 	mux.HandleFunc("POST /api/settings/models/refresh", a.requireAdmin(a.refreshModels))
 	mux.HandleFunc("GET /api/models", a.requireAdmin(a.listModels))
@@ -1460,13 +1461,24 @@ func (a *App) clientKeyConfigured() bool {
 	return a.db.QueryRow("SELECT value FROM settings WHERE key='client_key'").Scan(&hash) == nil && hash != ""
 }
 
+func (a *App) getClientKey(w http.ResponseWriter, _ *http.Request) {
+	var plain string
+	_ = a.db.QueryRow("SELECT value FROM settings WHERE key='client_key_plain'").Scan(&plain)
+	plain = strings.TrimSpace(plain)
+	if plain == "" {
+		writeJSON(w, 200, map[string]any{"client_key": "", "configured": a.clientKeyConfigured()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"client_key": plain, "configured": true})
+}
+
 func (a *App) rotateClientKey(w http.ResponseWriter, _ *http.Request) {
 	key, err := randomKey()
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not generate client key"})
 		return
 	}
-	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('client_key',?)", hashToken(key)); err != nil {
+	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('client_key',?),('client_key_plain',?)", hashToken(key), key); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not rotate client key"})
 		return
 	}
@@ -2426,8 +2438,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	}
 	requestSessionKey := sessionKey(r, parsed.User)
 	attempts := len(proxies)
-	if attempts > 3 {
-		attempts = 3
+	if attempts > 8 {
+		attempts = 8
 	}
 	var lastErr error
 	used := map[int64]struct{}{}
