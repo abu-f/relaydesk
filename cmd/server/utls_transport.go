@@ -180,7 +180,7 @@ func newSplitTransportWithTLSConfig(proxyURL *url.URL, tlsConfig *tls.Config) *s
 	}
 	httpsTr := base.Clone()
 	httpsTr.Proxy = nil
-	httpsTr.ForceAttemptHTTP2 = true
+	httpsTr.ForceAttemptHTTP2 = false
 	route := routedDialer{proxyURL: proxyURL, dialer: dialer}
 	httpsTr.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return dialUTLS(ctx, route, network, address, tlsConfig)
@@ -193,15 +193,16 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 	if err != nil {
 		return nil, err
 	}
-	standardConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+	// Match curl's behaviour: only offer http/1.1 in ALPN. Offering h2 makes
+	// Go's TLS ClientHello fingerprint more distinguishable and has been
+	// observed to trigger Cloudflare connection resets (EOF) through proxies.
+	standardConfig := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	if baseConfig != nil {
 		standardConfig = baseConfig.Clone()
 		if standardConfig.ServerName == "" {
 			standardConfig.ServerName = host
 		}
-		if len(standardConfig.NextProtos) == 0 {
-			standardConfig.NextProtos = []string{"h2", "http/1.1"}
-		}
+		standardConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	// First attempt: standard Go TLS. Direct connections and curl-equivalent
@@ -222,7 +223,7 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 
 	// Second attempt: uTLS with a spoofed browser fingerprint, useful when the
 	// upstream (e.g. Cloudflare) blocks Go's default ClientHello.
-	config := &utls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+	config := &utls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 	if baseConfig != nil {
 		config.RootCAs = baseConfig.RootCAs
 		config.ClientCAs = baseConfig.ClientCAs
@@ -232,9 +233,7 @@ func dialUTLS(ctx context.Context, route routedDialer, network, address string, 
 		if baseConfig.ServerName != "" {
 			config.ServerName = baseConfig.ServerName
 		}
-		if len(baseConfig.NextProtos) > 0 {
-			config.NextProtos = append([]string(nil), baseConfig.NextProtos...)
-		}
+		config.NextProtos = []string{"http/1.1"}
 	}
 	conn, err = route.dial(ctx, network, address)
 	if err != nil {
