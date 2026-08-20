@@ -3585,7 +3585,7 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-const proxySelect = "SELECT p.id,p.uri,p.scheme,p.host,p.port,COALESCE(p.username,''),COALESCE(p.encrypted_password,''),p.enabled,p.health_status,p.failure_count,COALESCE(p.cooldown_until,''),COALESCE(p.expires_at,''),COALESCE(p.last_checked_at,''),p.last_check_ok,p.created_at FROM proxies p"
+const proxySelect = "SELECT p.id,p.uri,p.scheme,p.host,p.port,COALESCE(p.username,''),COALESCE(p.encrypted_password,''),p.enabled,p.health_status,p.failure_count,COALESCE(p.cooldown_until,''),COALESCE(p.expires_at,''),COALESCE(p.last_checked_at,''),p.last_check_ok,COALESCE(p.last_latency_ms,-1),p.created_at FROM proxies p"
 
 func proxyFilterClause(state string, now time.Time) (string, []any, bool) {
 	nowText := now.Format(time.RFC3339)
