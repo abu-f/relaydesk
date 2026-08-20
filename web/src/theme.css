@@ -1,0 +1,168 @@
+/*!
+ * Relay Desk · UI theme override layer (theme.css)
+ * Only visual appearance is overridden: radius, shadows, spacing rhythm,
+ * hover / focus feedback. No business logic, markup structure or layout
+ * breakpoints are changed. Loaded after styles.css / security.css so that
+ * equal-specificity rules here win the cascade.
+ */
+
+/* ========== Design tokens ========== */
+:root{
+  --rd-radius-s:8px;
+  --rd-radius-m:12px;
+  --rd-radius-l:16px;
+  --rd-shadow-1:0 1px 2px rgba(37,40,36,.05),0 8px 22px rgba(37,40,36,.06);
+  --rd-shadow-2:0 6px 14px rgba(37,40,36,.09),0 18px 40px rgba(37,40,36,.12);
+  --rd-shadow-btn:0 6px 16px rgba(65,107,90,.28);
+  --rd-ease:cubic-bezier(.33,1,.68,1);
+  --rd-dur:.18s;
+}
+
+/* ========== Global base ========== */
+body{
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+::selection{background:rgba(65,107,90,.16)}
+
+/* Unified interaction transition for all controls */
+button,a,input,select,textarea,
+.icon-btn,.text-btn,.danger-icon{
+  transition:
+    background-color var(--rd-dur) var(--rd-ease),
+    color var(--rd-dur) var(--rd-ease),
+    border-color var(--rd-dur) var(--rd-ease),
+    box-shadow var(--rd-dur) var(--rd-ease),
+    transform var(--rd-dur) var(--rd-ease),
+    opacity var(--rd-dur) var(--rd-ease);
+}
+:focus-visible{outline:2px solid #7c9784;outline-offset:2px}
+
+/* ========== Cards & panels ========== */
+.panel{
+  padding:26px;
+  border-color:#e8e3d7;
+  border-radius:var(--rd-radius-l);
+  box-shadow:var(--rd-shadow-1);
+}
+.pool-overview{
+  border-radius:var(--rd-radius-l);
+  box-shadow:var(--rd-shadow-1);
+}
+.stat,.model-card{
+  border-radius:var(--rd-radius-m);
+  box-shadow:var(--rd-shadow-1);
+  transition:transform .2s var(--rd-ease),box-shadow .2s var(--rd-ease);
+}
+.stat:hover,.model-card:hover{
+  transform:translateY(-2px);
+  box-shadow:var(--rd-shadow-2);
+}
+.hero-band{border-radius:20px;box-shadow:var(--rd-shadow-1)}
+.usage-rate-rail{border-radius:14px;overflow:hidden;box-shadow:var(--rd-shadow-1)}
+
+/* ========== Sidebar ========== */
+nav button{border-radius:10px}
+.brand-icon{transition:border-color var(--rd-dur) var(--rd-ease)}
+.brand:hover .brand-icon{border-color:#f7f3ea}
+.logout:hover{color:#eceadf}
+
+/* ========== Header ========== */
+header h2{line-height:1.25}
+.endpoint{border-radius:9px}
+.icon-btn{border-radius:10px}
+.icon-btn:hover:not(:disabled){
+  transform:translateY(-1px);
+  box-shadow:0 4px 10px rgba(37,40,36,.10);
+}
+
+/* ========== Buttons ========== */
+.primary,.secondary,.danger-button{border-radius:10px;padding:11px 18px}
+.primary:hover:not(:disabled){
+  transform:translateY(-1px);
+  box-shadow:var(--rd-shadow-btn);
+}
+.primary:active:not(:disabled){transform:translateY(0);box-shadow:none}
+.secondary:hover:not(:disabled){background:#d7e1d4;transform:translateY(-1px)}
+.secondary:active:not(:disabled){transform:translateY(0)}
+.danger-button:hover:not(:disabled){
+  background:#f3ddd4;
+  border-color:#cda79b;
+  transform:translateY(-1px);
+}
+.text-btn:hover:not(:disabled){color:#355443}
+.danger-icon:hover{color:#8f5348}
+
+/* ========== Inputs & form controls ========== */
+.login-card input,.panel input,.panel textarea,.panel select,
+.expiry-controls select,.proxy-state-filter select,.retention-controls select,
+.page-size-control select,.usage-filter-select select,.usage-custom-range input{
+  border-radius:10px;
+  transition:border-color var(--rd-dur) var(--rd-ease),box-shadow var(--rd-dur) var(--rd-ease);
+}
+.login-card input:hover,.panel input:hover,.panel textarea:hover,.panel select:hover,
+.expiry-controls select:hover,.proxy-state-filter select:hover,
+.retention-controls select:hover,.usage-filter-select select:hover,
+.usage-custom-range input:hover{
+  border-color:#b8b2a3;
+}
+.copy-field{border-radius:12px;overflow:hidden}
+.time-segments{border-radius:11px;overflow:hidden}
+
+/* ========== Tables & list rows ========== */
+.table-row,.model-row,.mini-row,.daily-usage-row{
+  border-radius:10px;
+  transition:background-color .16s var(--rd-ease);
+}
+.table-row:hover,.daily-usage-row:hover,
+.model-row:hover,.mini-row:hover{
+  background:#f3f0e8;
+}
+
+/* ========== Chips & tags ========== */
+.count-chip,.status-tag,.helper-tag,.scheme-badge,.test-feedback{border-radius:7px}
+.error-line,.drawer-error,.test-result{border-radius:10px}
+
+/* ========== Overlays ========== */
+.toast{border-radius:12px;box-shadow:0 14px 34px rgba(21,23,19,.30)}
+.drawer{border-radius:20px 0 0 20px;box-shadow:-24px 0 60px rgba(21,23,19,.30)}
+.login-card{border-radius:20px}
+
+/* ========== Spacing rhythm (desktop only, keeps mobile breakpoints intact) ========== */
+@media (min-width:901px){
+  .main{padding:36px 48px 66px}
+  .page{gap:24px}
+  header{margin-bottom:30px;padding-bottom:26px}
+}
+@media (min-width:581px){
+  .stat-grid{gap:14px}
+}
+.two-col{gap:16px}
+.config-grid{gap:16px}
+
+/* ========== Scrollbars ========== */
+.daily-usage-scroll::-webkit-scrollbar,
+.usage-table-scroll::-webkit-scrollbar{height:8px}
+.daily-usage-scroll::-webkit-scrollbar-thumb,
+.usage-table-scroll::-webkit-scrollbar-thumb{
+  background:#cfcabf;
+  border-radius:4px;
+}
+.daily-usage-scroll::-webkit-scrollbar-track,
+.usage-table-scroll::-webkit-scrollbar-track{background:transparent}
+
+/* ========== Mobile corrections for this layer ========== */
+@media (max-width:700px){
+  .drawer{border-radius:0}
+}
+
+/* ========== Accessibility: reduced motion ========== */
+@media (prefers-reduced-motion:reduce){
+  button,a,input,select,textarea,.icon-btn,.text-btn,.danger-icon{transition:none}
+  .stat,.model-card{transition:none}
+  .stat:hover,.model-card:hover,
+  .primary:hover:not(:disabled),.secondary:hover:not(:disabled),
+  .danger-button:hover:not(:disabled),.icon-btn:hover:not(:disabled){
+    transform:none;
+  }
+}

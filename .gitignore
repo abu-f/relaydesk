@@ -1,0 +1,14 @@
+.env
+.dsh-remote-meta.json
+*.db
+*.db-*
+*.db.backup
+data/
+backups/
+server.exe
+*.exe
+opencode-proxy-linux
+opencode-proxy-linux-amd64
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo

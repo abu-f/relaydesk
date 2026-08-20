@@ -1,0 +1,12 @@
+.git
+.env
+data
+*.db
+*.db-shm
+*.db-wal
+node_modules
+web/dist
+smoke.exe
+opencode-proxy-linux*
+backups
+*.backup
