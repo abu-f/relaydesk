@@ -150,7 +150,7 @@ var skippedMihomoNames = map[string]struct{}{
 }
 
 // 订阅服务商常嵌入的“流量/到期”展示伪节点，无实际连接能力
-var skippedMihomoNamePatterns = []string{"剩余流量", "套餐到期", "已用流量", "套餐余额", "到期时间"}
+var skippedMihomoNamePatterns = []string{"剩余流量", "套餐到期", "已用流量", "套餐余额", "到期时间", "距离下次重置", "下次重置"}
 
 func normalizeMihomoType(t string) string {
 	var b strings.Builder
